@@ -1,3 +1,2 @@
 # LessonPlanner-AI
-To run the code
-'''streamlit run app.py'''
+To run the code use this command : streamlit run app.py
