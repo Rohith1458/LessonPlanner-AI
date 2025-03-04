@@ -2,22 +2,18 @@ import streamlit as st
 import fitz
 import os
 import getpass
-import pandas as pd
-import re
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.chat_models import init_chat_model
-import json
 import sqlite3
+import time
+import re
+import json
+from langchain.chat_models import init_chat_model
 
 # Ensure API Key
 if not os.environ.get("GROQ_API_KEY"):
     os.environ["GROQ_API_KEY"] = getpass.getpass("Enter API key for Groq: ")
 
-llm = init_chat_model("deepseek-r1-distill-llama-70b", model_provider="groq")
+llm = init_chat_model("llama-3.3-70b-versatile", model_provider="groq")
 
-# Database setup
 def init_db():
     conn = sqlite3.connect("chapters.db")
     c = conn.cursor()
@@ -31,8 +27,9 @@ def save_chapters_to_db(chapters):
     c = conn.cursor()
     c.execute("DELETE FROM chapters")  # Clear previous data
     for chapter in chapters:
-        c.execute("INSERT INTO chapters VALUES (?, ?, ?, ?)", 
-                  (chapter["chapter_number"], chapter["title"], chapter["start_page"], chapter["end_page"]))
+        if None not in (chapter["start_page"], chapter["end_page"]):
+            c.execute("INSERT INTO chapters VALUES (?, ?, ?, ?)", 
+                      (chapter["chapter_number"], chapter["title"], chapter["start_page"], chapter["end_page"]))
     conn.commit()
     conn.close()
 
@@ -42,27 +39,27 @@ def get_chapters_from_db():
     c.execute("SELECT * FROM chapters")
     chapters = c.fetchall()
     conn.close()
-    return [{"chapter_number": row[0], "title": row[1], "start_page": row[2], "end_page": row[3]} for row in chapters]
+    return [{"chapter_number": row[0], "title": row[1], 
+             "start_page": int(row[2]) if row[2] else None,
+             "end_page": int(row[3]) if row[3] else None} for row in chapters]
 
-# Extract text from PDF
-def extract_text_from_pdf(pdf_bytes, max_pages=None):
+def get_first_chapter_start_page():
+    chapters = get_chapters_from_db()
+    return chapters[0]["start_page"] if chapters else 1
+
+def extract_text_from_pdf(pdf_bytes, start_page, end_page):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = []
     for i, page in enumerate(doc):
-        if max_pages and i >= max_pages:
-            break
-        text.append(page.get_text("text"))
-    return "\n".join(text)
+        if start_page <= i + 1 <= end_page:
+            text.append(page.get_text("text"))
+    return "\n".join(text) if text else ""
 
-# Detect Table of Contents
 def detect_toc(text):
-    prompt = f"""
-    Extract the Table of Contents or Index page which has the following content or headings in that page CHAPTER NUMBER,CONTENTS from the given text and return a valid JSON array.
-    Each item should have:
-    - "chapter_number": (string)
-    - "title": (string)
-    - "start_page": (integer)
-    - "end_page": (integer)
+    prompt = f'''
+    Extract the structured Table of Contents from the given text.
+    Identify the chapter numbers, titles, and their respective start and end pages.
+    Ensure that both structured and unstructured formats are considered and return JSON output.
 
     Example JSON Output:
     [
@@ -72,77 +69,149 @@ def detect_toc(text):
 
     Text:
     {text}
-    """
+    '''
     response = llm.invoke(prompt)
-    print("Groq Response:", response.content)  # Debugging step
-    
-    if not response.content.strip():
-        raise ValueError("Groq returned an empty response")
-    
-    match = re.search(r"\[\s*\{.*?\}\s*\]", response.content, re.DOTALL)
-    if not match:
-        raise ValueError(f"Invalid JSON from Groq: {response.content}")
-    
-    extracted_json = match.group(0)  # Get the JSON part
-    print("Extracted JSON:", extracted_json)  # Debugging step
+    if not response or not response.content.strip():
+        st.error("Error: Empty response from LLM while detecting TOC.")
+        return []
     
     try:
-        return json.loads(extracted_json)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse extracted JSON: {extracted_json}") from e
+        match = re.search(r"\[.*\]", response.content, re.DOTALL)
+        if match:
+            extracted_json = match.group(0)
+            return json.loads(extracted_json)
+        else:
+            st.error("Error: No valid JSON found in response.")
+            return []
+    except json.JSONDecodeError:
+        st.error("Error: Invalid JSON response from LLM while detecting TOC.")
+        return []
 
-# Extract chapter text
-def extract_chapter(text, start_page, end_page):
-    start_page+=8
-    end_page+=8
-    pages = text.split("\n\n")
-    return "\n".join(pages[start_page:end_page+1])
-
-# Lesson Plan Generation
-def get_lesson_plan(chapter_text, num_periods):
-    prompt = f"""
-    Create a structured lesson plan for the following chapter content, divided into {num_periods} periods.
-    Ensure each period evenly covers the topics and provides key points in 2-3 lines.
+def extract_chapter(pdf_bytes, start_page, end_page, first_chapter_first_page):
+    first_chapter_start_page_doc = get_first_chapter_start_page()
+    adjustment = first_chapter_first_page-first_chapter_start_page_doc
+    start_page += adjustment
+    end_page += adjustment
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    font_sizes = {}
+    headings = []
+    total_words = 0
+    max_words = 2000
+    print("Start page:",start_page)
+    print("End page:",end_page)
     
-    Chapter Content:
-    {chapter_text}    
+    for i, page in enumerate(doc):
+        if start_page <= i + 1 <= end_page:
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            font_sizes[span["size"]] = font_sizes.get(span["size"], 0) + len(span["text"].split())
+    
+    sorted_sizes = sorted(font_sizes.items(), key=lambda x: -x[0])
+    
+    selected_sizes = []
+    for size, words in sorted_sizes:
+        if total_words + words <= max_words:
+            selected_sizes.append(size)
+            total_words += words
+        else:
+            break
+    
+    for i, page in enumerate(doc):
+        if start_page <= i + 1 <= end_page:
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            if span["size"] in selected_sizes or "color" in span or "bold" in span:
+                                headings.append(span["text"])
+    
+    return "\n".join(headings) if headings else ""
+
+def get_lesson_plan(chapter_text, num_periods, class_level):
+    max_chunk_size = 2000  # Limit per request to avoid token overflow
+    words = chapter_text.split()  # Split text into words
+    chunks = [" ".join(words[i:i+max_chunk_size]) for i in range(0, len(words), max_chunk_size)]
+
+    extracted_subtopics = []
+
+    # Step 1: Extract key subtopics from each chunk
+    for i, chunk in enumerate(chunks):
+        prompt = '''
+        Identify the most important subtopics from the following chapter content.
+        Ensure each subtopic is concise and meaningful.
+
+        Chapter Content:
+        {}
+
+        Output format:
+        - Subtopic 1
+        - Subtopic 2
+        - Subtopic 3
+        '''.format(chunk)
+
+        response = llm.invoke(prompt)
+        subtopics = response.content.strip().split("\n")
+        extracted_subtopics.extend(subtopics)
+
+    # Step 2: Generate final lesson plan using extracted subtopics
+    final_prompt = '''
+    Create a structured lesson plan for the following chapter content, divided into {} periods, for class level {}.
+    Ensure each period evenly covers the topics and provides key points in 2-3 lines.
+
+    Key Subtopics:
+    {}
+
     Output format:
     | Period No | Topics to be Covered |
     |-----------|----------------------|
-    """
-    response = llm.invoke(prompt)
+    '''.format(num_periods, class_level, "\n".join(extracted_subtopics))
+
+    response = llm.invoke(final_prompt)
     return response.content.strip()
 
-# Streamlit App
-st.title("📚 PDF Knowledge Extractor with TOC Detection")
+
+
+
+st.title("📚 PDF Knowledge Extractor")
+status_placeholder = st.empty()
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded_file:
-    with st.spinner("Processing PDF..."):
-        init_db()
-        pdf_bytes = uploaded_file.read()  # Read once and reuse
-        
-        if not pdf_bytes:
-            st.error("Failed to read PDF. Please upload a valid file.")
+    init_db()
+    pdf_bytes = uploaded_file.read()
+    
+    index_start_page = st.number_input("Enter Index Start Page:", min_value=1, step=1, value=1)
+    index_end_page = st.number_input("Enter Index End Page:", min_value=1, step=1, value=1)
+    
+    if st.button("Detect the Index"):
+        status_placeholder.text("Processing index pages...")
+        index_text = extract_text_from_pdf(pdf_bytes, index_start_page, index_end_page)
+        chapters = detect_toc(index_text)
+        if chapters:
+            save_chapters_to_db(chapters)
         else:
-            text_15_pages = extract_text_from_pdf(pdf_bytes, max_pages=15)
-            
-            try:
-                toc_data = detect_toc(text_15_pages)
-                save_chapters_to_db(toc_data)
-                st.success("✅ Table of Contents detected and stored!")
-            except ValueError as e:
-                st.error(f"Failed to extract TOC: {e}")
+            st.error("No chapters found in the extracted text.")
     
     chapters = get_chapters_from_db()
-    chapter_options = {f"{ch['chapter_number']}: {ch['title']}" : ch for ch in chapters}
-    selected_chapter = st.selectbox("Select a chapter", list(chapter_options.keys()))
-    num_periods = st.number_input("Enter number of periods:", min_value=1, step=1, value=5)
-
-    if st.button("Generate Lesson Plan"):
-        chapter_info = chapter_options[selected_chapter]
-        full_text = extract_text_from_pdf(pdf_bytes)
-        chapter_text = extract_chapter(full_text, chapter_info["start_page"], chapter_info["end_page"])
-        lesson_plan = get_lesson_plan(chapter_text, num_periods)
-        st.subheader("📌 Lesson Plan")
-        st.markdown(lesson_plan)
+    if chapters:
+        chapter_options = {f"{ch['chapter_number']}: {ch['title']} (Pg {ch['start_page']} - {ch['end_page']})": ch for ch in chapters}
+        selected_chapter = st.selectbox("Select a chapter", list(chapter_options.keys()))
+        num_periods = st.number_input("Enter number of periods:", min_value=1, step=1, value=5)
+        first_chapter_first_page = st.number_input("Enter the first chapter's first page:", min_value=1, step=1, value=10)
+        
+        class_level = st.text_input("Enter the class level (e.g., 7th Grade):")  # New input field for class level
+        
+        if st.button("Generate Lesson Plan"):
+            if class_level:
+                status_placeholder.text("Extracting chapter for lesson plan...")
+                chapter_info = chapter_options[selected_chapter]
+                chapter_text = extract_chapter(pdf_bytes, chapter_info["start_page"], chapter_info["end_page"], first_chapter_first_page)
+                lesson_plan = get_lesson_plan(chapter_text, num_periods, class_level)  # Pass class level to the function
+                st.success("✅ Lesson plan generated!")
+                st.markdown(lesson_plan)
+            else:
+                st.error("Please enter the class level.")
